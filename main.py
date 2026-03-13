@@ -9,6 +9,12 @@ from presidio_analyzer import AnalyzerEngine, PatternRecognizer, RecognizerRegis
 from presidio_anonymizer import AnonymizerEngine
 import firebase_admin
 from firebase_admin import credentials, firestore
+import spacy
+
+# Автоматичне завантаження моделі, якщо її немає
+if not spacy.util.is_package("en_core_web_lg"):
+    with st.spinner("Завантаження мовної моделі (це займе хвилину при першому запуску)..."):
+        spacy.cli.download("en_core_web_lg")
 
 
 def init_firebase_connection():
@@ -64,6 +70,13 @@ def load_anonymization_engines(custom_names_list):
     registry.add_recognizer(card_rec)
 
     _analyzer = AnalyzerEngine(registry=registry, default_score_threshold=0.4)
+    _anonymizer = AnonymizerEngine()
+    # Явно вказуємо модель spaCy
+    _analyzer = AnalyzerEngine(
+        default_score_threshold=0.4,
+        nlp_engine_name="spacy",
+        models=[{"lang_code": "en", "model_name": "en_core_web_lg"}]
+    )
     _anonymizer = AnonymizerEngine()
     return _analyzer, _anonymizer
 
