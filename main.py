@@ -30,13 +30,7 @@ db = init_firebase()
 # --- 2. ЗАВАНТАЖЕННЯ МОДЕЛІ NLP ---
 @st.cache_resource
 def load_nlp():
-    # Використовуємо полегшену модель для швидкості та стабільності на Cloud
-    try:
-        return spacy.load("en_core_web_sm")
-    except OSError:
-        # Якщо модель не знайдена, завантажуємо її (для локального запуску)
-        spacy.cli.download("en_core_web_sm")
-        return spacy.load("en_core_web_sm")
+    return spacy.load("pl_core_news_sm")
 
 
 nlp = load_nlp()
@@ -61,15 +55,21 @@ def process_text(text, custom_list, mapping):
     # Збираємо збіги, щоб замінювати з кінця (щоб не збивати індекси)
     matches = []
     for ent in doc.ents:
-        if ent.label_ in ["PERSON", "ORG", "GPE"]:
-            matches.append((ent.start_char, ent.end_char, ent.label_))
+        # Ігноруємо дуже короткі сутності та ті, що не схожі на імена/міста
+        if len(ent.text) < 3:
+            continue
 
+        if ent.label_ in ["PERSON", "ORG", "GPE"]:
+            # Додаткова перевірка: якщо слово у нижньому регістрі — це навряд чи ім'я
+            if ent.text[0].isupper():
+                matches.append((ent.start_char, ent.end_char, ent.label_))
     # 2. Пошук через Regex (Пошта, Телефон, IBAN, Картки)
     patterns = {
         "EMAIL": r"[\w\.-]+@[\w\.-]+\.\w+",
-        "PHONE": r"\+?\d[\d\-\s]{7,15}\d",
         "IBAN": r"[A-Z]{2}\d{2}[A-Z0-9]{11,30}",
-        "CARD": r"\b(?:\d[ -]*?){13,16}\b"
+        "CARD": r"\b(?:\d[ -]*?){13,16}\b",
+        "PHONE": r"(\+48|\+380|0)\s?[\d\-\s]{7,12}\b",  # Більш точний паттерн для UA/PL
+        "SWIFT": r"\b[A-Z]{6}[A-Z0-9]{2}([A-Z0-9]{3})?\b"  # Додаємо SWIFT
     }
 
     for label, pattern in patterns.items():
