@@ -11,17 +11,27 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 
 
-# --- 1. ІНІЦІАЛІЗАЦІЯ FIREBASE ---
 def init_firebase_connection():
-    try:
-        firebase_admin.get_app()
-    except ValueError:
-        # Вкажіть шлях до вашого json-ключа
-        cred = credentials.Certificate("firebase-key.json")
-        firebase_admin.initialize_app(cred)
+    if not firebase_admin._apps:
+        try:
+            # Отримуємо словник з секретів Streamlit
+            # Перетворюємо на звичайний dict, щоб уникнути проблем з типами
+            firebase_info = dict(st.secrets["firebase"])
+
+            # Виправляємо переноси рядків у приватному ключі
+            if "private_key" in firebase_info:
+                firebase_info["private_key"] = firebase_info["private_key"].replace("\\n", "\n")
+
+            cred = credentials.Certificate(firebase_info)
+            firebase_admin.initialize_app(cred)
+        except Exception as e:
+            st.error(f"Помилка конфігурації Firebase: {e}. Перевірте Secrets у налаштуваннях Streamlit.")
+            st.stop()
+
     return firestore.client()
 
 
+# Ініціалізація бази даних
 db = init_firebase_connection()
 
 
