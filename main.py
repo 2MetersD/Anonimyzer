@@ -3,220 +3,182 @@ import pandas as pd
 import io
 import re
 import zipfile
+import spacy
 from docx import Document
 import fitz  # PyMuPDF
-from presidio_analyzer import AnalyzerEngine, PatternRecognizer, RecognizerRegistry
-from presidio_anonymizer import AnonymizerEngine
 import firebase_admin
 from firebase_admin import credentials, firestore
-import spacy
-
-# Автоматичне завантаження моделі, якщо її немає
-if not spacy.util.is_package("en_core_web_lg"):
-    with st.spinner("Завантаження мовної моделі (це займе хвилину при першому запуску)..."):
-        spacy.cli.download("en_core_web_lg")
 
 
-def init_firebase_connection():
+# --- 1. ІНІЦІАЛІЗАЦІЯ FIREBASE ---
+def init_firebase():
     if not firebase_admin._apps:
         try:
-            # Отримуємо словник з секретів Streamlit
-            # Перетворюємо на звичайний dict, щоб уникнути проблем з типами
-            firebase_info = dict(st.secrets["firebase"])
-
-            # Виправляємо переноси рядків у приватному ключі
-            if "private_key" in firebase_info:
-                firebase_info["private_key"] = firebase_info["private_key"].replace("\\n", "\n")
-
-            cred = credentials.Certificate(firebase_info)
+            fb_secrets = dict(st.secrets["firebase"])
+            fb_secrets["private_key"] = fb_secrets["private_key"].replace("\\n", "\n")
+            cred = credentials.Certificate(fb_secrets)
             firebase_admin.initialize_app(cred)
         except Exception as e:
-            st.error(f"Помилка конфігурації Firebase: {e}. Перевірте Secrets у налаштуваннях Streamlit.")
+            st.error(f"Firebase Error: {e}")
             st.stop()
-
     return firestore.client()
 
 
-# Ініціалізація бази даних
-db = init_firebase_connection()
+db = init_firebase()
 
 
-# --- 2. ДВИГУН АНАЛІЗУ (БЕЗ SHADOWING) ---
+# --- 2. ЗАВАНТАЖЕННЯ МОДЕЛІ NLP ---
 @st.cache_resource
-def load_anonymization_engines(custom_names_list):
-    registry = RecognizerRegistry()
-    registry.load_predefined_recognizers()
-
-    if custom_names_list:
-        list_regex = r"\b(" + "|".join(map(re.escape, custom_names_list)) + r")\b"
-        list_rec = PatternRecognizer(
-            supported_entity="MANUAL_LIST",
-            patterns=[{"name": "custom_list", "score": 1.0, "regex": list_regex}]
-        )
-        registry.add_recognizer(list_rec)
-
-    # Додаємо IBAN
-    iban_rec = PatternRecognizer(
-        supported_entity="IBAN",
-        patterns=[{"name": "iban", "score": 1.0, "regex": r"[A-Z]{2}\d{2}[A-Z0-9]{11,30}"}]
-    )
-    registry.add_recognizer(iban_rec)
-
-    # Додаємо Credit Card
-    card_rec = PatternRecognizer(
-        supported_entity="CREDIT_CARD",
-        patterns=[{"name": "card", "score": 1.0, "regex": r"\b(?:\d[ -]*?){13,16}\b"}]
-    )
-    registry.add_recognizer(card_rec)
-
-    _analyzer = AnalyzerEngine(registry=registry, default_score_threshold=0.4)
-    _anonymizer = AnonymizerEngine()
-    # Явно вказуємо модель spaCy
-    _analyzer = AnalyzerEngine(
-        default_score_threshold=0.4,
-        nlp_engine_name="spacy",
-        models=[{"lang_code": "en", "model_name": "en_core_web_lg"}]
-    )
-    _anonymizer = AnonymizerEngine()
-    return _analyzer, _anonymizer
+def load_nlp():
+    # Використовуємо полегшену модель для швидкості та стабільності на Cloud
+    try:
+        return spacy.load("en_core_web_sm")
+    except OSError:
+        # Якщо модель не знайдена, завантажуємо її (для локального запуску)
+        spacy.cli.download("en_core_web_sm")
+        return spacy.load("en_core_web_sm")
 
 
-# --- 3. ДОПОМІЖНІ ФУНКЦІЇ ---
-
-def get_token_for_value(original_value, entity_type, mapping_dict):
-    if original_value not in mapping_dict:
-        # Рахуємо скільки вже є токенів цього типу для індексу
-        idx = len([v for v in mapping_dict.values() if entity_type in v]) + 1
-        mapping_dict[original_value] = f"<{entity_type}_{idx}>"
-    return mapping_dict[original_value]
+nlp = load_nlp()
 
 
-def process_text_content(raw_text, analyzer_engine, mapping_dict):
-    if not raw_text or str(raw_text) == "nan":
-        return raw_text
-
-    analysis_results = analyzer_engine.analyze(text=str(raw_text), language='en')
-    sorted_res = sorted(analysis_results, key=lambda x: x.start, reverse=True)
-
-    final_text = str(raw_text)
-    for res in sorted_res:
-        original_chunk = final_text[res.start:res.end]
-        token = get_token_for_value(original_chunk, res.entity_type, mapping_dict)
-        final_text = final_text[:res.start] + token + final_text[res.end:]
-    return final_text
+# --- 3. ЛОГІКА ТОКЕНІЗАЦІЇ (REGEX + NLP) ---
+def get_token(value, entity_type, mapping):
+    if value not in mapping:
+        idx = len([v for v in mapping.values() if entity_type in v]) + 1
+        mapping[value] = f"<{entity_type}_{idx}>"
+    return mapping[value]
 
 
-# --- 4. ОБРОБКА ФАЙЛІВ ---
+def process_text(text, custom_list, mapping):
+    if not text or str(text) == "nan":
+        return text
 
-def handle_excel(file_bytes, analyzer_engine, mapping_dict):
-    df = pd.read_excel(io.BytesIO(file_bytes))
-    for col in df.columns:
-        df[col] = df[col].astype(str).apply(lambda x: process_text_content(x, analyzer_engine, mapping_dict))
+    doc = nlp(str(text))
+    result_text = str(text)
 
-    out_buffer = io.BytesIO()
-    df.to_excel(out_buffer, index=False)
-    return out_buffer.getvalue()
+    # 1. Пошук сутностей через spaCy (Імена)
+    # Збираємо збіги, щоб замінювати з кінця (щоб не збивати індекси)
+    matches = []
+    for ent in doc.ents:
+        if ent.label_ in ["PERSON", "ORG", "GPE"]:
+            matches.append((ent.start_char, ent.end_char, ent.label_))
+
+    # 2. Пошук через Regex (Пошта, Телефон, IBAN, Картки)
+    patterns = {
+        "EMAIL": r"[\w\.-]+@[\w\.-]+\.\w+",
+        "PHONE": r"\+?\d[\d\-\s]{7,15}\d",
+        "IBAN": r"[A-Z]{2}\d{2}[A-Z0-9]{11,30}",
+        "CARD": r"\b(?:\d[ -]*?){13,16}\b"
+    }
+
+    for label, pattern in patterns.items():
+        for match in re.finditer(pattern, result_text):
+            matches.append((match.start(), match.end(), label))
+
+    # 3. Пошук вашого кастомного списку з БД
+    if custom_list:
+        for word in custom_list:
+            if word.lower() in result_text.lower():
+                for m in re.finditer(re.escape(word), result_text, re.IGNORECASE):
+                    matches.append((m.start(), m.end(), "CUSTOM"))
+
+    # Сортуємо та видаляємо дублікати координат
+    matches = sorted(list(set(matches)), key=lambda x: x[0], reverse=True)
+
+    # Заміна
+    for start, end, label in matches:
+        original = result_text[start:end]
+        token = get_token(original, label, mapping)
+        result_text = result_text[:start] + token + result_text[end:]
+
+    return result_text
 
 
-def handle_docx(file_bytes, analyzer_engine, mapping_dict):
+# --- 4. ОБРОБНИКИ ФАЙЛІВ ---
+
+def handle_pdf(file_bytes, custom_list, mapping):
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    for page in doc:
+        # Для PDF ми просто замальовуємо знайдені слова з кастомного списку та Regex
+        # (NLP в PDF складніше через координати, тому фокусуємось на точному пошуку)
+        for label, pattern in {"EMAIL": r"\S+@\S+", "IBAN": r"[A-Z]{2}\d{2}.+"}.items():
+            for m in page.search_for(pattern):  # Тут можна додати більше пошуку
+                page.add_redact_annot(m, fill=(0, 0, 0))
+
+        if custom_list:
+            for word in custom_list:
+                for area in page.search_for(word):
+                    token = get_token(word, "CUSTOM", mapping)
+                    page.add_redact_annot(area, fill=(0, 0, 0))
+                    page.apply_redactions()
+                    page.insert_text(area.tl, token, color=(1, 1, 1), fontsize=8)
+    return doc.tobytes()
+
+
+def handle_docx(file_bytes, custom_list, mapping):
     doc = Document(io.BytesIO(file_bytes))
     for p in doc.paragraphs:
-        p.text = process_text_content(p.text, analyzer_engine, mapping_dict)
+        p.text = process_text(p.text, custom_list, mapping)
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
-                cell.text = process_text_content(cell.text, analyzer_engine, mapping_dict)
+                cell.text = process_text(cell.text, custom_list, mapping)
+    out = io.BytesIO()
+    doc.save(out)
+    return out.getvalue()
 
-    out_buffer = io.BytesIO()
-    doc.save(out_buffer)
-    return out_buffer.getvalue()
+
+def handle_xlsx(file_bytes, custom_list, mapping):
+    df = pd.read_excel(io.BytesIO(file_bytes))
+    for col in df.columns:
+        df[col] = df[col].astype(str).apply(lambda x: process_text(x, custom_list, mapping))
+    out = io.BytesIO()
+    df.to_excel(out, index=False)
+    return out.getvalue()
 
 
-def handle_pdf(file_bytes: bytes, analyzer_engine: AnalyzerEngine, mapping_dict: dict) -> bytes:
-    # Явно відкриваємо документ
-    doc = fitz.open(stream=file_bytes, filetype="pdf")
+# --- 5. ІНТЕРФЕЙС ---
 
-    try:
-        for page in doc:
-            page_text = page.get_text()
-            results = analyzer_engine.analyze(text=page_text, language='en')
-
-            if results:
-                for res in results:
-                    original_val = page_text[res.start:res.end].strip()
-                    if not original_val:
-                        continue
-
-                    token_val = get_token_for_value(original_val, res.entity_type, mapping_dict)
-
-                    # Пошук координат
-                    areas = page.search_for(original_val)
-                    for area in areas:
-                        # Важливо: деякі версії fitz очікують apply_redactions без контексту
-                        page.add_redact_annot(area, fill=(0, 0, 0))
-
-                # Викликаємо один раз на сторінку
-                page.apply_redactions()
-
-        return doc.tobytes()
-    finally:
-        doc.close()  # Гарантоване закриття ресурсу
-
-# --- 5. UI СТРІМЛІТ ---
-
-st.set_page_config(page_title="Data Masking Tool", layout="wide")
-st.title("🛡️ Корпоративний Токенізатор")
+st.title("🛡️ Secure Tokenizer Pro")
 
 with st.sidebar:
-    st.header("Керування списком")
-    settings_ref = db.collection("settings").document("blacklist")
-    current_data = settings_ref.get().to_dict() or {"names": ""}
+    st.header("Налаштування списку")
+    ref = db.collection("settings").document("blacklist")
+    db_names = ref.get().to_dict().get("names", "") if ref.get().exists else ""
 
-    input_names = st.text_area("Назви компаній/ПІБ (через кому):", value=current_data.get("names", ""))
+    input_names = st.text_area("Введіть назви через кому:", value=db_names)
+    if st.button("Зберегти в БД"):
+        ref.set({"names": input_names})
+        st.success("Оновлено!")
 
-    if st.button("Зберегти у Firestore"):
-        settings_ref.set({"names": input_names})
-        st.success("Базу оновлено")
+    blacklist = [n.strip() for n in input_names.split(",") if n.strip()]
 
-    active_list = [n.strip() for n in input_names.split(",") if n.strip()]
+files = st.file_uploader("Завантажте файли", accept_multiple_files=True, type=['pdf', 'docx', 'xlsx'])
 
-# Завантажуємо двигуни
-engine_analyzer, engine_anonymizer = load_anonymization_engines(active_list)
-
-uploaded_files = st.file_uploader("Виберіть файли", type=["xlsx", "docx", "pdf"], accept_multiple_files=True)
-
-if uploaded_files and st.button("Почати обробку"):
+if files and st.button("Обробити"):
     session_mapping = {}
-    zip_buffer = io.BytesIO()
+    zip_buf = io.BytesIO()
 
-    with zipfile.ZipFile(zip_buffer, 'w') as zf:
-        for uploaded_file in uploaded_files:
-            ext = uploaded_file.name.split(".")[-1].lower()
-            file_data = uploaded_file.read()  # Читаємо байти один раз
+    with zipfile.ZipFile(zip_buf, 'w') as zf:
+        for f in files:
+            data = f.read()
+            ext = f.name.split(".")[-1].lower()
 
-            with st.spinner(f"Обробка {uploaded_file.name}..."):
-                if ext == "xlsx":
-                    processed = handle_excel(file_data, engine_analyzer, session_mapping)
-                elif ext == "docx":
-                    processed = handle_docx(file_data, engine_analyzer, session_mapping)
-                elif ext == "pdf":
-                    processed = handle_pdf(file_data, engine_analyzer, session_mapping)
-                else:
-                    continue
+            if ext == 'pdf':
+                res = handle_pdf(data, blacklist, session_mapping)
+            elif ext == 'docx':
+                res = handle_docx(data, blacklist, session_mapping)
+            elif ext == 'xlsx':
+                res = handle_xlsx(data, blacklist, session_mapping)
 
-                zf.writestr(f"masked_{uploaded_file.name}", processed)
+            zf.writestr(f"anonymized_{f.name}", res)
 
-        # Створюємо звіт
-        if session_mapping:
-            report_df = pd.DataFrame(list(session_mapping.items()), columns=["Оригінальний текст", "Токен"])
-            report_buf = io.BytesIO()
-            report_df.to_excel(report_buf, index=False)
-            zf.writestr("token_mapping_report.xlsx", report_buf.getvalue())
+        # Звіт
+        report = pd.DataFrame(session_mapping.items(), columns=["Оригінал", "Токен"])
+        rep_buf = io.BytesIO()
+        report.to_excel(rep_buf, index=False)
+        zf.writestr("mapping_report.xlsx", rep_buf.getvalue())
 
     st.success("Готово!")
-    st.download_button(
-        label="📥 Завантажити архів з результатом",
-        data=zip_buffer.getvalue(),
-        file_name="processed_documents.zip",
-        mime="application/zip"
-    )
+    st.download_button("Завантажити архів", zip_buf.getvalue(), "result.zip")
