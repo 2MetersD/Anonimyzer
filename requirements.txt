@@ -1,0 +1,9 @@
+streamlit
+pandas
+openpyxl
+python-docx
+pymupdf
+presidio-analyzer
+presidio-anonymizer
+firebase-admin
+spacy
