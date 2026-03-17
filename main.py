@@ -108,21 +108,61 @@ def process_text(text, custom_list, mapping):
 # --- 4. ОБРОБНИКИ ФАЙЛІВ ---
 
 def handle_pdf(file_bytes, custom_list, mapping):
+    # Відкриваємо документ з байтів
     doc = fitz.open(stream=file_bytes, filetype="pdf")
-    for page in doc:
-        # Для PDF додаємо пошук Sp. z o.o.
-        patterns_to_redact = [r"\S+@\S+", r"[A-Z]{2}\d{2}[A-Z0-9]{12,30}", r"Sp\.\s?z\s?o\.o\."]
-        for pattern in patterns_to_redact:
-            for m in page.search_for(pattern):
-                page.add_redact_annot(m, fill=(0, 0, 0))
 
+    for page in doc:
+        # 1. Отримуємо весь текст сторінки для аналізу
+        page_text = page.get_text("text")
+
+        # 2. Використовуємо нашу основну функцію аналізу,
+        # але нам потрібні не замінені токени, а координати оригінальних слів.
+        # Тому ми трохи схитруємо: знайдемо всі сутності через nlp та regex
+
+        matches_to_draw = []
+
+        # Додаємо Regex паттерни (ті самі, що в process_text)
+        patterns = {
+            "EMAIL": r"[\w\.-]+@[\w\.-]+\.\w+",
+            "IBAN": r"\b[A-Z]{2}\d{2}[A-Z0-9]{12,30}\b",
+            "CARD": r"\b(?:\d[ -]*?){13,16}\b",
+            "PHONE": r"(?:\+\d{2,3}|0)\s?[\d\-\s]{7,12}\b",
+            "PESEL": r"\b\d{11}\b",
+            "NIP": r"\b\d{10}\b|\b\d{3}-\d{3}-\d{2}-\d{2}\b",
+            "ORG_LEGAL": r"\b[A-Z][\w\s\.-]+(?:Sp\.\s?z\s?o\.o\.|S\.A\.|Sp\.\s?k\.|Sp\.\s?j\.)\b"
+        }
+
+        # Пошук через Regex
+        for label, pattern in patterns.items():
+            for match in re.finditer(pattern, page_text):
+                matches_to_draw.append(match.group())
+
+        # Пошук через NLP (імена, міста)
+        spacy_doc = nlp(page_text)
+        for ent in spacy_doc.ents:
+            if ent.label_ in ["PERSON", "ORG", "GPE"] and ent.text not in WHITELIST:
+                matches_to_draw.append(ent.text)
+
+        # Пошук через Custom Blacklist
         if custom_list:
             for word in custom_list:
-                for area in page.search_for(word):
-                    token = get_token(word, "CUSTOM", mapping)
-                    page.add_redact_annot(area, fill=(0, 0, 0))
-                    page.apply_redactions()
-                    page.insert_text(area.tl, token, color=(1, 1, 1), fontsize=8)
+                if word.lower() in page_text.lower():
+                    matches_to_draw.append(word)
+
+        # 3. Виконуємо "замальовування" (Redaction) для кожного знайденого слова
+        for search_term in set(matches_to_draw):
+            if len(search_term) < 3: continue  # Захист від замальовування випадкових літер
+
+            areas = page.search_for(search_term)
+            for area in areas:
+                # Додаємо чорний прямокутник
+                page.add_redact_annot(area, fill=(0, 0, 0))
+                page.apply_redactions()
+
+                # Поверх можна вставити токен (білим кольором)
+                token = get_token(search_term, "HIDDEN", mapping)
+                page.insert_text(area.tl, token, color=(1, 1, 1), fontsize=7)
+
     return doc.tobytes()
 
 
