@@ -30,7 +30,7 @@ db = init_firebase()
 # --- 2. ЗАВАНТАЖЕННЯ МОДЕЛІ NLP ---
 @st.cache_resource
 def load_nlp():
-    return spacy.load("pl_core_news_sm")
+    return spacy.load("pl_core_news_lg")
 
 
 nlp = load_nlp()
