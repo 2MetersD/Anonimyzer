@@ -35,8 +35,14 @@ def load_nlp():
 
 nlp = load_nlp()
 
+# --- 3. ЛОГІКА ТОКЕНІЗАЦІЇ ---
 
-# --- 3. ЛОГІКА ТОКЕНІЗАЦІЇ (REGEX + NLP) ---
+WHITELIST = {
+    "Biuro", "Miejsce", "Data", "Dyrektor", "Prezes", "Firma", "Konto",
+    "Numer", "Adres", "Spotkanie", "Protokół", "Raport", "Warszawa", "Poznań"
+}
+
+
 def get_token(value, entity_type, mapping):
     if value not in mapping:
         idx = len([v for v in mapping.values() if entity_type in v]) + 1
@@ -50,43 +56,47 @@ def process_text(text, custom_list, mapping):
 
     doc = nlp(str(text))
     result_text = str(text)
-
-    # 1. Пошук сутностей через spaCy (Імена)
-    # Збираємо збіги, щоб замінювати з кінця (щоб не збивати індекси)
     matches = []
-    for ent in doc.ents:
-        # Ігноруємо дуже короткі сутності та ті, що не схожі на імена/міста
-        if len(ent.text) < 3:
-            continue
 
-        if ent.label_ in ["PERSON", "ORG", "GPE"]:
-            # Додаткова перевірка: якщо слово у нижньому регістрі — це навряд чи ім'я
-            if ent.text[0].isupper():
-                matches.append((ent.start_char, ent.end_char, ent.label_))
-    # 2. Пошук через Regex (Пошта, Телефон, IBAN, Картки)
+    # 1. Покращений Regex (PESEL, NIP, Sp. z o.o., Решта)
     patterns = {
         "EMAIL": r"[\w\.-]+@[\w\.-]+\.\w+",
-        "IBAN": r"[A-Z]{2}\d{2}[A-Z0-9]{11,30}",
+        "IBAN": r"\b[A-Z]{2}\d{2}[A-Z0-9]{12,30}\b",
         "CARD": r"\b(?:\d[ -]*?){13,16}\b",
-        "PHONE": r"(\+48|\+380|0)\s?[\d\-\s]{7,12}\b",  # Більш точний паттерн для UA/PL
-        "SWIFT": r"\b[A-Z]{6}[A-Z0-9]{2}([A-Z0-9]{3})?\b"  # Додаємо SWIFT
+        "PHONE": r"(?:\+\d{2,3}|0)\s?[\d\-\s]{7,12}\b",
+        "PESEL": r"\b\d{11}\b",
+        "NIP": r"\b\d{10}\b|\b\d{3}-\d{3}-\d{2}-\d{2}\b",
+        # Спеціальний пошук компаній з юридичними формами (Sp. z o.o., S.A. і т.д.)
+        "ORG_LEGAL": r"\b[A-Z][\w\s\.-]+(?:Sp\.\s?z\s?o\.o\.|S\.A\.|Sp\.\s?k\.|Sp\.\s?j\.)\b"
     }
 
     for label, pattern in patterns.items():
         for match in re.finditer(pattern, result_text):
-            matches.append((match.start(), match.end(), label))
+            # Якщо це юридична форма, маркуємо як ORG
+            final_label = "ORG" if label == "ORG_LEGAL" else label
+            matches.append((match.start(), match.end(), final_label))
 
-    # 3. Пошук вашого кастомного списку з БД
+    # 2. Custom Blacklist з БД
     if custom_list:
         for word in custom_list:
-            if word.lower() in result_text.lower():
+            if len(word) > 2:
                 for m in re.finditer(re.escape(word), result_text, re.IGNORECASE):
                     matches.append((m.start(), m.end(), "CUSTOM"))
 
-    # Сортуємо та видаляємо дублікати координат
+    # 3. NLP (тільки вільні зони)
+    for ent in doc.ents:
+        if ent.text in WHITELIST:
+            continue
+
+        is_overlap = any(m[0] < ent.end_char and ent.start_char < m[1] for m in matches)
+
+        if not is_overlap and ent.label_ in ["PERSON", "ORG", "GPE"]:
+            if len(ent.text) > 2 and ent.text[0].isupper():
+                matches.append((ent.start_char, ent.end_char, ent.label_))
+
+    # Сортування з кінця
     matches = sorted(list(set(matches)), key=lambda x: x[0], reverse=True)
 
-    # Заміна
     for start, end, label in matches:
         original = result_text[start:end]
         token = get_token(original, label, mapping)
@@ -100,10 +110,10 @@ def process_text(text, custom_list, mapping):
 def handle_pdf(file_bytes, custom_list, mapping):
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     for page in doc:
-        # Для PDF ми просто замальовуємо знайдені слова з кастомного списку та Regex
-        # (NLP в PDF складніше через координати, тому фокусуємось на точному пошуку)
-        for label, pattern in {"EMAIL": r"\S+@\S+", "IBAN": r"[A-Z]{2}\d{2}.+"}.items():
-            for m in page.search_for(pattern):  # Тут можна додати більше пошуку
+        # Для PDF додаємо пошук Sp. z o.o.
+        patterns_to_redact = [r"\S+@\S+", r"[A-Z]{2}\d{2}[A-Z0-9]{12,30}", r"Sp\.\s?z\s?o\.o\."]
+        for pattern in patterns_to_redact:
+            for m in page.search_for(pattern):
                 page.add_redact_annot(m, fill=(0, 0, 0))
 
         if custom_list:
@@ -140,23 +150,25 @@ def handle_xlsx(file_bytes, custom_list, mapping):
 
 # --- 5. ІНТЕРФЕЙС ---
 
+st.set_page_config(page_title="Secure Tokenizer Pro", page_icon="🛡️")
 st.title("🛡️ Secure Tokenizer Pro")
 
 with st.sidebar:
-    st.header("Налаштування списку")
+    st.header("Ustawienia")
     ref = db.collection("settings").document("blacklist")
-    db_names = ref.get().to_dict().get("names", "") if ref.get().exists else ""
+    db_data = ref.get().to_dict() if ref.get().exists else {"names": ""}
+    db_names = db_data.get("names", "")
 
-    input_names = st.text_area("Введіть назви через кому:", value=db_names)
-    if st.button("Зберегти в БД"):
+    input_names = st.text_area("Czarna lista (nazwy firm, nazwiska):", value=db_names)
+    if st.button("Zapisz w Firebase"):
         ref.set({"names": input_names})
-        st.success("Оновлено!")
+        st.success("Zapisano!")
 
     blacklist = [n.strip() for n in input_names.split(",") if n.strip()]
 
-files = st.file_uploader("Завантажте файли", accept_multiple_files=True, type=['pdf', 'docx', 'xlsx'])
+files = st.file_uploader("Dodaj pliki (PDF, DOCX, XLSX)", accept_multiple_files=True, type=['pdf', 'docx', 'xlsx'])
 
-if files and st.button("Обробити"):
+if files and st.button("Uruchom anonimizację"):
     session_mapping = {}
     zip_buf = io.BytesIO()
 
@@ -174,11 +186,10 @@ if files and st.button("Обробити"):
 
             zf.writestr(f"anonymized_{f.name}", res)
 
-        # Звіт
-        report = pd.DataFrame(session_mapping.items(), columns=["Оригінал", "Токен"])
+        report = pd.DataFrame(session_mapping.items(), columns=["Oryginał", "Token"])
         rep_buf = io.BytesIO()
         report.to_excel(rep_buf, index=False)
-        zf.writestr("mapping_report.xlsx", rep_buf.getvalue())
+        zf.writestr("raport_mapowania.xlsx", rep_buf.getvalue())
 
-    st.success("Готово!")
-    st.download_button("Завантажити архів", zip_buf.getvalue(), "result.zip")
+    st.success("Przetwarzanie zakończone!")
+    st.download_button("Pobierz wyniki (ZIP)", zip_buf.getvalue(), "wyniki.zip")
